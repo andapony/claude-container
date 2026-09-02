@@ -19,6 +19,20 @@
 # output, diffs, and transcripts all reference host-valid paths):
 #   docker run -d --name claude-dev -v "$HOME/projects":"$HOME/projects" -w "$HOME/projects" -v claude-config:/home/rob/.claude claude-dev sleep infinity
 #
+# On Linux the runtime is rootless podman, not Docker (see the setup
+# playbook's `podman' tag for why -- briefly: no root-equivalent `docker'
+# group, and its user-space networking keeps container egress subject to
+# OpenSnitch, which Docker's kernel-forwarded bridge egress escapes):
+#   podman build -t claude-dev --build-arg HOST_HOME="$HOME" claude-container
+#   podman run -d --name claude-dev --userns=keep-id -v "$HOME/projects":"$HOME/projects" -w "$HOME/projects" -v claude-config:/home/rob/.claude:U claude-dev sleep infinity
+#
+#   --userns=keep-id maps the host user to the same UID in here, so files
+#   written into the mount stay owned by that user on the host. Without it
+#   rootless podman maps this container's rob to an unrelated subuid and
+#   everything it writes lands misowned. The volume's `:U' suffix is the
+#   keep-id counterpart of the mkdir below -- it chowns the named volume to
+#   the mapped user on first mount.
+#
 # Notes:
 #   - The mount is the entire host-visibility policy: everything
 #     under ~/projects is in scope for every session. For untrusted
@@ -127,7 +141,11 @@ ENV TZ=America/Los_Angeles
 
 COPY --from=emacs-builder /emacs-root/usr/local/ /usr/local/
 
-RUN useradd -m -s /bin/zsh rob
+# The UID is pinned rather than left to Debian's numbering, because the Linux
+# side now depends on its value: --userns=keep-id maps the host user (1000) to
+# the same UID in here, and a mismatch would quietly misown the whole mount.
+ARG USER_UID=1000
+RUN useradd -m -s /bin/zsh -u "${USER_UID}" rob
 USER rob
 WORKDIR /home/rob
 
@@ -142,10 +160,19 @@ RUN mkdir -p /home/rob/.claude
 # that leave the container -- diffs, compile output, transcripts -- should
 # resolve to it, or the host cannot open what they name.
 #
-# Safe as a plain `ln -s' here: /home/rob is freshly created, so there is no
-# existing directory for the link to be created inside of instead.
+# Skipped when the host's home is this container's own /home/rob, as it is on
+# a Linux host: there the identity mount already lands exactly on ~/projects,
+# so there is nothing to alias -- and making one anyway would be fatal. `ln
+# -s' does not object to a self-referential link, so the image would build
+# clean and only fail at run time, the mount's destination resolving into an
+# ELOOP.
+#
+# Safe as a plain `ln -s' otherwise: /home/rob is freshly created, so there is
+# no existing directory for the link to be created inside of instead.
 ARG HOST_HOME=/Users/rob
-RUN ln -s "${HOST_HOME}/projects" /home/rob/projects
+RUN if [ "${HOST_HOME}/projects" != "/home/rob/projects" ]; then \
+        ln -s "${HOST_HOME}/projects" /home/rob/projects; \
+    fi
 
 # Git identity. Without it `git commit' in here fails outright ("Author
 # identity unknown"): no repo under the mount carries a repo-local identity,

@@ -23,8 +23,14 @@
 # playbook's `podman' tag for why -- briefly: no root-equivalent `docker'
 # group, and its user-space networking keeps container egress subject to
 # OpenSnitch, which Docker's kernel-forwarded bridge egress escapes):
-#   podman build -t claude-dev --build-arg HOST_HOME="$HOME" claude-container
+#   podman build --format docker -t claude-dev --build-arg HOST_HOME="$HOME" claude-container
 #   podman run -d --name claude-dev --userns=keep-id -v "$HOME/projects":"$HOME/projects" -w "$HOME/projects" -v claude-config:/home/rob/.claude:U claude-dev sleep infinity
+#
+#   --format docker is not optional: podman defaults to the OCI image format,
+#   which has no SHELL directive, so the `SHELL ["/bin/bash", "-c"]' below is
+#   discarded with a warning and the nvm layer runs under dash. It happens to
+#   survive that today only because NVM_DIR is also set explicitly; the
+#   directive is here to be honoured, not to be redundant.
 #
 #   --userns=keep-id maps the host user to the same UID in here, so files
 #   written into the mount stay owned by that user on the host. Without it

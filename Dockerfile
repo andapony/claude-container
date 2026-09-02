@@ -52,8 +52,13 @@
 # ---------------------------------------------------------------------------
 # Emacs builder — kept in its own stage so ~600MB of -dev packages and the
 # source tree never land in the final image. Only the install tree is copied.
+#
+# The base image is named in full. Docker would infer docker.io/library/ from
+# a bare `golang:...', but podman refuses a short name unless the host has
+# configured unqualified-search-registries, which Debian and Ubuntu
+# deliberately ship empty. Spelling it out builds under both.
 # ---------------------------------------------------------------------------
-FROM golang:1.27-bookworm AS emacs-builder
+FROM docker.io/library/golang:1.27-bookworm AS emacs-builder
 
 ARG EMACS_VERSION=31.1
 # sha256 of emacs-31.1.tar.xz, taken from a copy whose detached .sig verified
@@ -100,7 +105,7 @@ RUN ./configure \
 # ---------------------------------------------------------------------------
 # Final image
 # ---------------------------------------------------------------------------
-FROM golang:1.27-bookworm
+FROM docker.io/library/golang:1.27-bookworm
 
 # GitHub CLI's apt repo, added before the install below so one `apt-get
 # update' covers it. gh is in no Debian suite, and the standalone .deb would

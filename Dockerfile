@@ -13,6 +13,10 @@
 #   --build-arg GIT_USER_EMAIL=... --build-arg GIT_USER_NAME=...
 #                                  # identity for commits made in here
 #                                  # (default Rob Duncan andapony@…)
+#   --build-arg ACP_VERSION=0.81.2 # claude-agent-acp release to install
+#                                  # (default latest). Pass it to update
+#                                  # the adapter -- a plain rebuild
+#                                  # reuses the cached one (see the ARG)
 #
 # Run (identity mount: same absolute path inside and out, so no
 # path translation is needed anywhere — agent-shell, compile
@@ -189,10 +193,19 @@ SHELL ["/bin/bash", "-c"]
 # a dangling `claude' and still exit 0, shipping a broken image. `ls'
 # fails on no match, and the trailing `claude --version' proves the link
 # resolves before the layer is committed.
+#
+# ACP_VERSION is what makes an update possible. Docker caches this layer
+# by its instruction text, not by what the registry would now resolve, so
+# with a fixed `latest' a rebuild reuses the old adapter indefinitely --
+# and --no-cache would recompile Emacs to get past it. A changed ARG
+# value invalidates only the layers from here down, so naming the new
+# release re-runs just this step. The version the Emacs header's update
+# indicator reports is the one to pass.
+ARG ACP_VERSION=latest
 RUN curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash \
     && . "$NVM_DIR/nvm.sh" \
     && nvm install --lts \
-    && npm install -g @agentclientprotocol/claude-agent-acp \
+    && npm install -g "@agentclientprotocol/claude-agent-acp@${ACP_VERSION}" \
     && ln -s "$(dirname "$(nvm which node)")" "$NVM_DIR/current" \
     && CLAUDE_BIN="$(ls "$(npm root -g)"/@agentclientprotocol/claude-agent-acp/node_modules/@anthropic-ai/claude-agent-sdk-*/claude)" \
     && ln -s "$CLAUDE_BIN" "$NVM_DIR/current/claude" \
@@ -203,8 +216,10 @@ ENV CLAUDE_CONFIG_DIR=/home/rob/.claude
 
 # The bundled binary carries its own updater. Letting it self-update
 # would desync it from the SDK release that pins it -- the pairing the
-# single-binary layout above exists to preserve. Updates come from
-# rebuilding this image, which re-resolves the adapter to latest.
+# single-binary layout above exists to preserve. Updates come from the
+# adapter instead: rebuilding with a new ACP_VERSION, or installing it
+# into a running container with Emacs's
+# `rjd/agent-shell-version-install-update'.
 # Interactive Claude Code on the host is installed separately by the
 # setup playbook's native installer and still updates itself.
 ENV DISABLE_AUTOUPDATER=1

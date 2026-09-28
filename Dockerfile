@@ -1,7 +1,43 @@
 # Claude Code + agent-shell dev container
 #
-# Build:
-#   docker build -t claude-dev claude-container
+# The runtime differs by platform: Docker on macOS, rootless podman on Linux.
+# Both mount ~/projects at the same absolute path inside and out, so no path
+# translation is needed anywhere — agent-shell, compile output, diffs, and
+# transcripts all reference host-valid paths.
+#
+# macOS (Docker Desktop):
+#   docker build -t claude-dev --build-arg HOST_HOME="$HOME" claude-container
+#   docker run -d --name claude-dev -v "$HOME/projects":"$HOME/projects" -w "$HOME/projects" -v claude-config:/home/rob/.claude claude-dev sleep infinity
+#   docker exec -it claude-dev claude     # first run only, to log in
+#   docker exec -it claude-dev zsh        # interactive shell
+#
+# Linux (rootless podman, not Docker -- see the setup playbook's `podman' tag
+# for why: no root-equivalent `docker' group, and podman's user-space
+# networking keeps container egress subject to OpenSnitch, which Docker's
+# kernel-forwarded bridge egress escapes):
+#   podman build --format docker -t claude-dev --build-arg HOST_HOME="$HOME" claude-container
+#   podman run -d --name claude-dev --userns=keep-id -v "$HOME/projects":"$HOME/projects" -w "$HOME/projects" -v claude-config:/home/rob/.claude:U claude-dev sleep infinity
+#   podman exec -it claude-dev claude     # first run only, to log in
+#   podman exec -it claude-dev zsh        # interactive shell
+#
+# Why the Linux invocation carries three extra pieces:
+#   --format docker   podman defaults to the OCI image format, which has no
+#                     SHELL directive, so the `SHELL ["/bin/bash", "-c"]'
+#                     below is discarded with a warning and the nvm layer
+#                     runs under dash. It survives that today only because
+#                     NVM_DIR is set explicitly as well; the directive is
+#                     here to be honoured, not to be redundant.
+#   --userns=keep-id  maps the host user to the same UID in here, so files
+#                     written into the mount stay owned by that user on the
+#                     host. Without it rootless podman maps this container's
+#                     rob to an unrelated subuid and everything it writes
+#                     lands misowned.
+#   :U on the volume  chowns the named volume to the mapped user on first
+#                     mount -- the keep-id counterpart of the mkdir below.
+#
+# HOST_HOME is passed on both, but does opposite things: on macOS it is the
+# /Users/rob the ~/projects alias points at, and on Linux it is /home/rob,
+# which suppresses that alias entirely because the mount already lands there.
 #
 # Build knobs (all optional):
 #   --build-arg NATIVE_COMP=yes    # lazy nativecomp; much faster image build
@@ -18,32 +54,33 @@
 #                                  # the adapter -- a plain rebuild
 #                                  # reuses the cached one (see the ARG)
 #
-# Run (identity mount: same absolute path inside and out, so no
-# path translation is needed anywhere — agent-shell, compile
-# output, diffs, and transcripts all reference host-valid paths):
-#   docker run -d --name claude-dev -v "$HOME/projects":"$HOME/projects" -w "$HOME/projects" -v claude-config:/home/rob/.claude claude-dev sleep infinity
-#
 # Notes:
 #   - The mount is the entire host-visibility policy: everything
 #     under ~/projects is in scope for every session. For untrusted
 #     or unattended (--dangerously-skip-permissions) work, prefer a
 #     separate narrow container mounting a throwaway clone only.
-#   - -w is just the default for interactive `docker exec` shells;
+#   - -w is just the default for the interactive `exec` shells above;
 #     agent-shell anchors each session's cwd per-project via ACP.
-#   - First run only: `docker exec -it claude-dev claude` to log in
+#   - The login above is needed once per container, not once per session
 #     (use the paste-code fallback if the browser callback fails).
 #   - Emacs is a terminal build (no X/GUI): it is here for in-container
 #     `emacs -nw`, batch/ert runs, and as the TRAMP-side remote Emacs.
 #   - gh keeps its credentials in ~/.config/gh, which no volume above
 #     persists: `gh auth login` has to be repeated whenever the container
-#     is recreated. To skip that, pass a token instead -- `docker run -e
-#     GH_TOKEN=...` -- which gh prefers over its stored login anyway.
+#     is recreated. To skip that, pass a token instead -- `docker run`/
+#     `podman run -e GH_TOKEN=...` -- which gh prefers over its stored
+#     login anyway.
 
 # ---------------------------------------------------------------------------
 # Emacs builder — kept in its own stage so ~600MB of -dev packages and the
 # source tree never land in the final image. Only the install tree is copied.
+#
+# The base image is named in full. Docker would infer docker.io/library/ from
+# a bare `golang:...', but podman refuses a short name unless the host has
+# configured unqualified-search-registries, which Debian and Ubuntu
+# deliberately ship empty. Spelling it out builds under both.
 # ---------------------------------------------------------------------------
-FROM golang:1.27-bookworm AS emacs-builder
+FROM docker.io/library/golang:1.27-bookworm AS emacs-builder
 
 ARG EMACS_VERSION=31.1
 # sha256 of emacs-31.1.tar.xz, taken from a copy whose detached .sig verified
@@ -90,7 +127,7 @@ RUN ./configure \
 # ---------------------------------------------------------------------------
 # Final image
 # ---------------------------------------------------------------------------
-FROM golang:1.27-bookworm
+FROM docker.io/library/golang:1.27-bookworm
 
 # GitHub CLI's apt repo, added before the install below so one `apt-get
 # update' covers it. gh is in no Debian suite, and the standalone .deb would
@@ -131,7 +168,11 @@ ENV TZ=America/Los_Angeles
 
 COPY --from=emacs-builder /emacs-root/usr/local/ /usr/local/
 
-RUN useradd -m -s /bin/zsh rob
+# The UID is pinned rather than left to Debian's numbering, because the Linux
+# side now depends on its value: --userns=keep-id maps the host user (1000) to
+# the same UID in here, and a mismatch would quietly misown the whole mount.
+ARG USER_UID=1000
+RUN useradd -m -s /bin/zsh -u "${USER_UID}" rob
 USER rob
 WORKDIR /home/rob
 
@@ -146,10 +187,19 @@ RUN mkdir -p /home/rob/.claude
 # that leave the container -- diffs, compile output, transcripts -- should
 # resolve to it, or the host cannot open what they name.
 #
-# Safe as a plain `ln -s' here: /home/rob is freshly created, so there is no
-# existing directory for the link to be created inside of instead.
+# Skipped when the host's home is this container's own /home/rob, as it is on
+# a Linux host: there the identity mount already lands exactly on ~/projects,
+# so there is nothing to alias -- and making one anyway would be fatal. `ln
+# -s' does not object to a self-referential link, so the image would build
+# clean and only fail at run time, the mount's destination resolving into an
+# ELOOP.
+#
+# Safe as a plain `ln -s' otherwise: /home/rob is freshly created, so there is
+# no existing directory for the link to be created inside of instead.
 ARG HOST_HOME=/Users/rob
-RUN ln -s "${HOST_HOME}/projects" /home/rob/projects
+RUN if [ "${HOST_HOME}/projects" != "/home/rob/projects" ]; then \
+        ln -s "${HOST_HOME}/projects" /home/rob/projects; \
+    fi
 
 # Git identity. Without it `git commit' in here fails outright ("Author
 # identity unknown"): no repo under the mount carries a repo-local identity,

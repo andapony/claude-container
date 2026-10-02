@@ -1,0 +1,59 @@
+#!/usr/bin/env node
+// page-shot -- screenshot a local HTML file or a URL with headless Chromium.
+//
+//   page-shot <file-or-url> [--out shot.png] [--viewport 1280x800] [--scale 1]
+//             [--scheme light|dark] [--selector CSS] [--full-page] [--wait 300]
+//
+// A file argument may carry a fragment (deck.html#10); it is kept, so a page
+// that routes on its hash opens where asked. --selector shots one element;
+// --full-page shots the whole scrollable page; otherwise the viewport.
+//
+// Generic on purpose: anything that knows one page's structure belongs in that
+// page's repo, as a playwright-core script of its own.
+const { chromium } = require('playwright-core');
+const { parseArgs } = require('node:util');
+const { resolve } = require('node:path');
+const { pathToFileURL } = require('node:url');
+
+const { values: o, positionals } = parseArgs({
+  allowPositionals: true,
+  options: {
+    out: { type: 'string', default: 'page-shot.png' },
+    viewport: { type: 'string', default: '1280x800' },
+    scale: { type: 'string', default: '1' },
+    scheme: { type: 'string', default: 'light' },
+    selector: { type: 'string' },
+    'full-page': { type: 'boolean', default: false },
+    wait: { type: 'string', default: '300' },
+  },
+});
+
+if (positionals.length !== 1) {
+  console.error('usage: page-shot <file-or-url> [--out F] [--viewport WxH] [--scale N] [--scheme light|dark] [--selector CSS] [--full-page] [--wait MS]');
+  process.exit(2);
+}
+
+// A scheme makes it a URL; anything else is a path, resolved against the cwd.
+function target(arg) {
+  if (/^[a-z][a-z0-9+.-]*:/i.test(arg)) return arg;
+  const hash = arg.indexOf('#');
+  const path = hash < 0 ? arg : arg.slice(0, hash);
+  return pathToFileURL(resolve(path)).href + (hash < 0 ? '' : arg.slice(hash));
+}
+
+(async () => {
+  const [width, height] = o.viewport.split('x').map(Number);
+  const browser = await chromium.launch({ executablePath: process.env.CHROMIUM_PATH });
+  try {
+    const page = await browser.newPage({
+      viewport: { width, height }, deviceScaleFactor: Number(o.scale), colorScheme: o.scheme,
+    });
+    await page.goto(target(positionals[0]), { waitUntil: 'load' });
+    await page.waitForTimeout(Number(o.wait));
+    if (o.selector) await page.locator(o.selector).screenshot({ path: o.out });
+    else await page.screenshot({ path: o.out, fullPage: o['full-page'] });
+    console.log(o.out);
+  } finally {
+    await browser.close();
+  }
+})().catch(e => { console.error(e.message); process.exit(1); });

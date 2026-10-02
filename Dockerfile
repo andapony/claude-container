@@ -53,6 +53,9 @@
 #                                  # (default latest). Pass it to update
 #                                  # the adapter -- a plain rebuild
 #                                  # reuses the cached one (see the ARG)
+#   --build-arg PLAYWRIGHT_VERSION=1.63.0
+#                                  # playwright-core release (default
+#                                  # latest); same caching rule as above
 #
 # Notes:
 #   - The mount is the entire host-visibility policy: everything
@@ -152,10 +155,21 @@ RUN install -m 0755 -d /etc/apt/keyrings \
 # Code's vendored copy, absent from `docker exec' shells and Emacs subprocesses.
 # xz-utils likewise — tar shells out to the `xz' binary rather than linking
 # liblzma, so without it `tar -xf *.tar.xz' fails in the runtime image.
+#
+# chromium is the headless browser sessions use to render and screenshot
+# HTML output -- slide decks, diagrams -- so the agent can look at what it
+# built rather than reason about markup. It comes from Debian rather than
+# from Playwright's own download, because Playwright's `install-deps' needs
+# root and node in the same layer, and this image only has node later, as
+# rob. Debian's package brings every shared library it needs with it, and
+# rebuilds keep it current like everything else here. The fonts give a
+# headless page real metrics: without them text falls back to whatever
+# fontconfig finds, and a layout measured that way does not match a desktop.
 RUN apt-get update && apt-get install -y git gh zsh curl \
       ripgrep file patch less jq xz-utils \
       libgccjit0 libgnutls30 libtree-sitter0 libsqlite3-0 \
       libncursesw6 libxml2 zlib1g libgmp10 \
+      chromium fonts-liberation fonts-noto-color-emoji \
     && rm -rf /var/lib/apt/lists/*
 
 # C.UTF-8 is built into glibc, so this costs no package and no layer.
@@ -263,6 +277,32 @@ RUN curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh |
 
 ENV PATH=/home/rob/.nvm/current:$PATH
 ENV CLAUDE_CONFIG_DIR=/home/rob/.claude
+
+# playwright-core drives the Debian chromium above. It is the library
+# without the browser download -- `playwright' proper would fetch a second
+# Chromium of its own on install -- so a script launches it with
+# `executablePath: process.env.CHROMIUM_PATH'.
+#
+# A layer of its own, so bumping either version re-runs only its own step.
+# PLAYWRIGHT_VERSION follows ACP_VERSION's pattern for the same reason.
+#
+# NODE_PATH lets a script anywhere `require("playwright-core")' without a
+# package.json beside it. It goes through a symlink, like `current' above,
+# because node resolves NODE_PATH lexically: `current/../lib/node_modules'
+# would collapse to ~/.nvm/lib/node_modules, which does not exist. NODE_PATH
+# serves `require' only; an ES module script has to use createRequire.
+ARG PLAYWRIGHT_VERSION=latest
+RUN . "$NVM_DIR/nvm.sh" \
+    && npm install -g "playwright-core@${PLAYWRIGHT_VERSION}" \
+    && ln -s "$(npm root -g)" "$NVM_DIR/global_modules"
+ENV NODE_PATH=/home/rob/.nvm/global_modules
+ENV CHROMIUM_PATH=/usr/bin/chromium
+
+# page-shot: a generic screenshot command on these two, so an agent in any
+# container -- including a narrow one mounting a single clone -- can look at
+# an HTML page it produced. Page-specific checks stay in the page's own repo.
+# The file's mode is committed executable; COPY keeps it.
+COPY page-shot /usr/local/bin/page-shot
 
 # The bundled binary carries its own updater. Letting it self-update
 # would desync it from the SDK release that pins it -- the pairing the

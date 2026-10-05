@@ -1,0 +1,35 @@
+#!/bin/sh
+# container-git -- run git inside the claude-dev container, from the host.
+#
+#   container-git <git args...>
+#
+# For the host's Emacs: point magit-git-executable and vc-git-program here, so
+# a repo's own .git/config and hooks -- which the agent can write -- run in
+# the container rather than as the host user, and pushes go out with the
+# container's restricted token. See AGENT-ACCESS.md.
+#
+# Works only because the mount lands at the same absolute path on both sides:
+# the host's cwd is passed through as-is. pwd -P, not $PWD, because Emacs
+# changes a subprocess's directory without updating the PWD it inherits.
+#
+# GIT_* variables are passed through by name: Magit sets GIT_EDITOR,
+# GIT_INDEX_FILE and others per call. Its usual GIT_EDITOR names the host's
+# emacsclient, which the container lacks; nil with-editor-emacsclient-executable
+# makes it use the sleeping editor, which works through process output instead.
+#
+# Outside ~/projects the container can't see the repo, and the agent can't
+# write to it, so git runs here as usual. Inside, a stopped container is an
+# error, never a quiet fallback to the host's git.
+#
+# CLAUDE_CONTAINER and CONTAINER_RUNTIME pick another container, or podman.
+
+dir=$(pwd -P)
+case "$dir/" in
+  "$HOME/projects/"*) ;;
+  *) exec git "$@" ;;
+esac
+set -- "${CLAUDE_CONTAINER:-claude-dev}" git "$@"
+for v in $(env | sed -n 's/^\(GIT_[A-Za-z0-9_]*\)=.*/\1/p'); do
+  set -- -e "$v" "$@"
+done
+exec "${CONTAINER_RUNTIME:-docker}" exec -i -w "$dir" "$@"

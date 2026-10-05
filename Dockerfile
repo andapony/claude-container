@@ -5,9 +5,9 @@
 # translation is needed anywhere — agent-shell, compile output, diffs, and
 # transcripts all reference host-valid paths.
 #
-# macOS (Docker Desktop):
+# macOS (OrbStack's docker CLI):
 #   docker build -t claude-dev --build-arg HOST_HOME="$HOME" claude-container
-#   docker run -d --name claude-dev -v "$HOME/projects":"$HOME/projects" -w "$HOME/projects" -v claude-config:/home/rob/.claude claude-dev sleep infinity
+#   docker run -d --name claude-dev --env-file "$HOME/.config/claude-dev/env" -v "$HOME/projects":"$HOME/projects" -w "$HOME/projects" -v claude-config:/home/rob/.claude claude-dev sleep infinity
 #   docker exec -it claude-dev claude     # first run only, to log in
 #   docker exec -it claude-dev zsh        # interactive shell
 #
@@ -16,7 +16,7 @@
 # networking keeps container egress subject to OpenSnitch, which Docker's
 # kernel-forwarded bridge egress escapes):
 #   podman build --format docker -t claude-dev --build-arg HOST_HOME="$HOME" claude-container
-#   podman run -d --name claude-dev --userns=keep-id -v "$HOME/projects":"$HOME/projects" -w "$HOME/projects" -v claude-config:/home/rob/.claude:U claude-dev sleep infinity
+#   podman run -d --name claude-dev --userns=keep-id --env-file "$HOME/.config/claude-dev/env" -v "$HOME/projects":"$HOME/projects" -w "$HOME/projects" -v claude-config:/home/rob/.claude:U claude-dev sleep infinity
 #   podman exec -it claude-dev claude     # first run only, to log in
 #   podman exec -it claude-dev zsh        # interactive shell
 #
@@ -49,6 +49,10 @@
 #   --build-arg GIT_USER_EMAIL=... --build-arg GIT_USER_NAME=...
 #                                  # identity for commits made in here
 #                                  # (default Rob Duncan andapony@…)
+#   --build-arg GITHUB_SSH_ALIAS=github-you
+#                                  # host's ~/.ssh/config alias for GitHub,
+#                                  # rewritten to HTTPS in here (default
+#                                  # github-andapony)
 #   --build-arg ACP_VERSION=0.81.2 # claude-agent-acp release to install
 #                                  # (default latest). Pass it to update
 #                                  # the adapter -- a plain rebuild
@@ -68,11 +72,16 @@
 #     (use the paste-code fallback if the browser callback fails).
 #   - Emacs is a terminal build (no X/GUI): it is here for in-container
 #     `emacs -nw`, batch/ert runs, and as the TRAMP-side remote Emacs.
-#   - gh keeps its credentials in ~/.config/gh, which no volume above
-#     persists: `gh auth login` has to be repeated whenever the container
-#     is recreated. To skip that, pass a token instead -- `docker run`/
-#     `podman run -e GH_TOKEN=...` -- which gh prefers over its stored
-#     login anyway.
+#   - --env-file supplies GH_TOKEN, the container's only GitHub credential:
+#     a fine-grained token, one `GH_TOKEN=...' line, kept outside ~/projects
+#     and mode 600. The file must exist or `run' fails; create it first.
+#     Env is fixed at `run', so a new token means recreating the container.
+#     gh prefers GH_TOKEN to a stored login, and git reaches it through the
+#     credential helper set up below. Don't `gh auth login' in here: that
+#     stores a far broader token, in ~/.config/gh, which no volume persists.
+#   - AGENT-ACCESS.md covers scoping that token, keeping it the only
+#     GitHub credential in here, and what the host should not run from
+#     the shared mount.
 
 # ---------------------------------------------------------------------------
 # Emacs builder — kept in its own stage so ~600MB of -dev packages and the
@@ -232,6 +241,23 @@ ARG GIT_USER_NAME="Rob Duncan"
 ARG GIT_USER_EMAIL=andapony@robduncan.info
 RUN git config --global user.name "${GIT_USER_NAME}" \
     && git config --global user.email "${GIT_USER_EMAIL}"
+
+# git reaches GitHub over HTTPS only, with the GH_TOKEN passed at `run'.
+# The credential helper is what `gh auth setup-git' writes -- the empty
+# entry first clears any helper an earlier config layer set, so nothing but
+# gh answers for github.com -- spelled out because setup-git refuses to run
+# without a login, and there is none at build time. gh reads GH_TOKEN each
+# time git asks, so the token is never in the image.
+#
+# The host's repos have SSH remotes, most through an ~/.ssh/config alias
+# that exists only on the host. Rewriting them here, rather than changing
+# the remotes, leaves the host pushing over SSH as before, while in here
+# the same remotes go over HTTPS -- there is no SSH key in here to use.
+ARG GITHUB_SSH_ALIAS=github-andapony
+RUN git config --global credential.https://github.com.helper '' \
+    && git config --global --add credential.https://github.com.helper '!gh auth git-credential' \
+    && git config --global url.https://github.com/.insteadOf "git@${GITHUB_SSH_ALIAS}:" \
+    && git config --global --add url.https://github.com/.insteadOf git@github.com:
 
 # nvm needs bash semantics when sourced; dash misderives NVM_DIR
 # from $0 as /bin. Set both explicitly (belt and suspenders).

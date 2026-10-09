@@ -174,11 +174,22 @@ RUN install -m 0755 -d /etc/apt/keyrings \
 # rebuilds keep it current like everything else here. The fonts give a
 # headless page real metrics: without them text falls back to whatever
 # fontconfig finds, and a layout measured that way does not match a desktop.
+#
+# The spelling packages serve the Emacs config's two checkers. aspell and
+# aspell-en are what ispell and flyspell run: init.el names aspell and the
+# en_US dictionary outright. jinx instead calls libenchant through a C module
+# it compiles on first load with `cc' and `pkg-config --cflags --libs
+# enchant-2' -- hence the -dev package and pkg-config, here in the runtime
+# image rather than the builder, because the compile happens in a running
+# container. Debian's libenchant-2-2 carries its own aspell backend, so both
+# checkers read the one dictionary. enchant-2 adds the `enchant-lsmod-2' CLI,
+# for seeing which backend and dictionaries enchant actually found.
 RUN apt-get update && apt-get install -y git gh zsh curl \
       ripgrep file patch less jq xz-utils \
       libgccjit0 libgnutls30 libtree-sitter0 libsqlite3-0 \
       libncursesw6 libxml2 zlib1g libgmp10 \
       chromium fonts-liberation fonts-noto-color-emoji \
+      aspell aspell-en libenchant-2-dev enchant-2 pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
 # C.UTF-8 is built into glibc, so this costs no package and no layer.

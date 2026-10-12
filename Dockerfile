@@ -44,6 +44,9 @@
 #   --build-arg EMACS_VERSION=... --build-arg EMACS_SHA256=...
 #                                  # both together — the checksum is enforced,
 #                                  # so bumping the version alone fails loudly
+#   --build-arg MU_VERSION=... --build-arg MU_SHA256=...
+#                                  # both together, as for Emacs; must match
+#                                  # setup's mu_version (see the ARG)
 #   --build-arg HOST_HOME=/home/you # where the host's home is, for the
 #                                  # ~/projects alias (default /Users/rob)
 #   --build-arg GIT_USER_EMAIL=... --build-arg GIT_USER_NAME=...
@@ -82,6 +85,14 @@
 #   - AGENT-ACCESS.md covers scoping that token, keeping it the only
 #     GitHub credential in here, and what the host should not run from
 #     the shared mount.
+
+# mu's pin, declared before the first FROM so that the stage building mu and
+# the final stage checking it read the one value. MU_VERSION is the twin of
+# `mu_version' (and MU_SHA256 of `mu_sha256') in the setup repo's
+# playbook.yml, which builds mu on the Linux hosts: the two pins move
+# together, so bump one and the other in the same change.
+ARG MU_VERSION=1.14.3
+ARG MU_SHA256=edea1a4e6be390a2bf5260e0156813f9b473c2d91da934b219dbb38229b0930a
 
 # ---------------------------------------------------------------------------
 # Emacs builder — kept in its own stage so ~600MB of -dev packages and the
@@ -137,6 +148,102 @@ RUN ./configure \
     && make install DESTDIR=/emacs-root
 
 # ---------------------------------------------------------------------------
+# mu builder -- mu, and with it mu4e, installed under ~/.local/mu, where the
+# Emacs config looks for both. emacs.d's mail code is developed and tested
+# against this mu, so it is built at the version the hosts run: MU_VERSION,
+# pinned at the top of this file.
+#
+# mu 1.14 needs GLib >= 2.80, and bookworm ships 2.74. The fix is a private
+# GLib, built here into mu's own prefix, with mu's binary carrying an RPATH
+# to it. The alternatives were worse:
+#   - Rebasing the whole image on trixie (GLib 2.84) would move every
+#     package above -- libgccjit, tree-sitter, chromium -- and the Emacs
+#     build with it, to land one mail indexer.
+#   - Building mu in a trixie stage and copying it over cannot work: a
+#     trixie binary wants trixie's glibc and libstdc++, newer than
+#     bookworm's, so it would not even start here.
+# The private GLib stays out of the system's way: it is in no ld.so path,
+# and only mu finds it, through that RPATH. DT_RPATH, deliberately, rather
+# than the DT_RUNPATH a modern linker writes by default: RUNPATH covers only
+# mu's own dependencies, so bookworm's gmime, loading GLib in turn, could
+# pull in the system's 2.74 beside the private 2.80. RPATH covers the whole
+# load. The rest of mu's needs bookworm meets as is: gmime 3.2.13 and
+# xapian 1.4.22 are mu's minimums exactly, and gcc 12 does C++20.
+#
+# Built FROM the Emacs builder because mu4e is byte-compiled by the Emacs
+# that will load it, and mu only builds mu4e when `-Demacs=' names one --
+# without it, it silently skips mu4e and the man pages. Copying the install
+# tree to /usr/local gives that Emacs every library it links, since this
+# stage still has the -dev packages. A rebuilt Emacs rebuilds mu too, which
+# is right: the .elc files should come from the Emacs that runs them.
+#
+# Meson comes from pip, pinned: bookworm's 1.0.1 is older than either
+# project accepts (GLib 2.80 wants 1.2, mu 1.14 1.3.2). 1.3.2 is the version
+# the Linux hosts' Mint 22 ships, so this builds with the same Meson they
+# do. `packaging' is a GLib build requirement, in the venv Meson runs from.
+# texinfo, already here, and install-info build mu4e's Info manual, which
+# is otherwise silently skipped. Completions are off because they would
+# install outside the prefix; scm (Guile) and cld2 are off so the result
+# does not depend on what happens to be installed -- the same set of
+# options as setup's build.
+# ---------------------------------------------------------------------------
+FROM emacs-builder AS mu-builder
+
+ARG MU_VERSION
+ARG MU_SHA256
+ARG GLIB_VERSION=2.80.5
+# sha256 from GNOME's published glib-2.80.5.sha256sum.
+ARG GLIB_SHA256=9f23a9de803c695bbfde7e37d6626b18b9a83869689dd79019bf3ae66c3e6771
+ARG MESON_VERSION=1.3.2
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      python3-venv ninja-build install-info \
+      libffi-dev libpcre2-dev libgmime-3.0-dev libxapian-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python3 -m venv /opt/meson \
+    && /opt/meson/bin/pip install --no-cache-dir "meson==${MESON_VERSION}" packaging
+ENV PATH=/opt/meson/bin:$PATH
+
+RUN cp -a /emacs-root/usr/local/. /usr/local/
+
+# The prefix is the path mu runs from in the final image, and both install
+# straight into it, the final stage copying the whole tree. Not a DESTDIR
+# staging install: mu's RPATH and GLib's .pc files record the prefix, and
+# mu skips install-info -- leaving the Info manual out of `dir' -- under a
+# DESTDIR.
+ENV MU_PREFIX=/home/rob/.local/mu
+WORKDIR /usr/src
+RUN set -eux; \
+    curl -fsSL --retry 2 -o glib.tar.xz \
+      "https://download.gnome.org/sources/glib/${GLIB_VERSION%.*}/glib-${GLIB_VERSION}.tar.xz"; \
+    echo "${GLIB_SHA256}  glib.tar.xz" | sha256sum -c -; \
+    curl -fsSL --retry 2 -o mu.tar.xz \
+      "https://github.com/djcb/mu/releases/download/v${MU_VERSION}/mu-${MU_VERSION}.tar.xz"; \
+    echo "${MU_SHA256}  mu.tar.xz" | sha256sum -c -; \
+    tar -xf glib.tar.xz; \
+    tar -xf mu.tar.xz
+
+WORKDIR /usr/src/glib-${GLIB_VERSION}
+RUN meson setup build --prefix="${MU_PREFIX}" --libdir=lib \
+      -Dtests=false -Dintrospection=disabled -Ddocumentation=false \
+      -Dman-pages=disabled -Dnls=disabled -Dselinux=disabled \
+      -Dlibmount=disabled -Dsysprof=disabled \
+    && meson compile -C build \
+    && meson install -C build
+
+WORKDIR /usr/src/mu-${MU_VERSION}
+RUN PKG_CONFIG_PATH="${MU_PREFIX}/lib/pkgconfig" \
+    LDFLAGS="-Wl,-rpath,${MU_PREFIX}/lib -Wl,--disable-new-dtags" \
+    meson setup build --prefix="${MU_PREFIX}" --libdir=lib \
+      -Demacs=/usr/local/bin/emacs \
+      -Dscm=disabled -Dcld2=disabled -Dtests=disabled \
+      -Dbash-completion=disabled -Dzsh-completion=disabled \
+    && meson compile -C build \
+    && meson install -C build \
+    && test -f "${MU_PREFIX}/share/emacs/site-lisp/mu4e/mu4e.elc"
+
+# ---------------------------------------------------------------------------
 # Final image
 # ---------------------------------------------------------------------------
 FROM docker.io/library/golang:1.27-bookworm
@@ -184,12 +291,16 @@ RUN install -m 0755 -d /etc/apt/keyrings \
 # container. Debian's libenchant-2-2 carries its own aspell backend, so both
 # checkers read the one dictionary. enchant-2 adds the `enchant-lsmod-2' CLI,
 # for seeing which backend and dictionaries enchant actually found.
+#
+# libgmime-3.0-0 and libxapian30 are what the mu built above links from the
+# system; its GLib it carries in its own prefix.
 RUN apt-get update && apt-get install -y git gh zsh curl \
       ripgrep file patch less jq xz-utils \
       libgccjit0 libgnutls30 libtree-sitter0 libsqlite3-0 \
       libncursesw6 libxml2 zlib1g libgmp10 \
       chromium fonts-liberation fonts-noto-color-emoji \
       aspell aspell-en libenchant-2-dev enchant-2 pkg-config \
+      libgmime-3.0-0 libxapian30 \
     && rm -rf /var/lib/apt/lists/*
 
 # C.UTF-8 is built into glibc, so this costs no package and no layer.
@@ -211,8 +322,23 @@ USER rob
 WORKDIR /home/rob
 
 # Pre-create the config mountpoint as rob so the named volume
-# inherits correct ownership on first mount (EACCES fix).
-RUN mkdir -p /home/rob/.claude
+# inherits correct ownership on first mount (EACCES fix). ~/.local
+# likewise, so the COPY of mu below does not create it as root.
+RUN mkdir -p /home/rob/.claude /home/rob/.local
+
+# mu from the builder stage, owned by rob so it can be rebuilt by hand in a
+# running container. The check proves, before the layer is committed, that
+# mu starts here -- every library it needs resolving in this image, not the
+# builder's -- and is the pinned version, with its mu4e beside it.
+#
+# INFOPATH puts mu4e's manual in `C-h i': Emacs searches no Info directory
+# under ~/.local/mu. The trailing colon keeps Emacs's own directories after
+# it, rather than replacing them.
+ARG MU_VERSION
+COPY --from=mu-builder --chown=rob:rob /home/rob/.local/mu/ /home/rob/.local/mu/
+RUN test "$(/home/rob/.local/mu/bin/mu --version)" = "version ${MU_VERSION}" \
+    && test -f /home/rob/.local/mu/share/emacs/site-lisp/mu4e/mu4e.elc
+ENV INFOPATH=/home/rob/.local/mu/share/info:
 
 # ~/projects as a convenience alias for the identity mount, which lands at
 # the host's absolute path (/Users/rob on macOS), not under this container's

@@ -154,12 +154,13 @@ What the run line adds instead (the Dockerfile header covers each):
   get reaped instead of piling up as zombies under `sleep infinity`.
 
 Nested containers share the agent container's network and PID namespace
-(so their entrypoint isn't PID 1), and have no cgroup limits. A nested
-container's root is `rob` outside it, so what it writes
-into a mounted `~/projects` directory is owned by `rob` on the Mac. An
-image that runs as a non-root user writes files under a subordinate UID
-instead. Pass `--userns=keep-id` to `docker run` to map that user to
-`rob`.
+(so their entrypoint isn't PID 1), and have no cgroup limits. What a
+nested container writes into a mounted `~/projects` directory is owned by
+`rob` on the Mac, whatever user the image runs as. OrbStack's file sharing
+records every write as the Mac user, and shows the mount as owned by
+whichever UID looks at it, so a non-root image can write there too. That
+holds only for the macOS mount: under podman on Linux, a non-root image
+would write as a subordinate UID.
 
 Images built in here live in the volume, so the Mac's Docker doesn't see
 them. On the Mac, rebuild from the same Dockerfile.

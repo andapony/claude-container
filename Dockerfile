@@ -48,8 +48,9 @@
 #                     container's own overlayfs root.
 # Nested containers share this container's network, so no tun device is
 # needed for slirp4netns or pasta, and its PID namespace, so no fresh /proc
-# has to be mounted under Docker's masks. Their root is rob outside them, so
-# files they write into a mounted ~/projects directory come out owned by rob.
+# has to be mounted under Docker's masks. Files they write into a mounted
+# ~/projects directory come out owned by rob on the Mac, as whatever user:
+# OrbStack's file sharing records every write as the Mac user.
 #
 # The Linux run line has none of these yet: rootless podman inside rootless
 # podman is a separate piece of work, so there `docker' in here won't run.

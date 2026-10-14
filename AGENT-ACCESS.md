@@ -3,7 +3,8 @@
 The container is the boundary, but two things cross it: whatever GitHub
 credential is passed in, and the `~/projects` mount, which the host reads
 and writes too. This covers how to keep both from widening what the agent
-can do.
+can do, and how agents get to build and run images without being given
+a third thing: the host's container engine.
 
 The commands use `docker`; on Linux substitute `podman`.
 
@@ -123,6 +124,62 @@ security boundary -- they match command text, which is easy to get around:
         "Bash(git push --force:*)", "Bash(git push -f:*)"
       ]
     }
+
+## Containers: the agent's own engine, never the host's
+
+Agents can build and run images in the container: `docker` in there is
+rootless podman, running as `rob`, inside the agent container. The Mac's
+engine stays out of reach. Never mount its socket
+(`/var/run/docker.sock`, or OrbStack's `~/.orbstack/run/docker.sock`)
+into the container, and never add `--privileged` or `--device`. With the
+socket, an agent could `docker exec` into the mail container and read its
+OAuth tokens and app passwords, or start a container that mounts all of
+`$HOME`. A container engine's API has no scopes that would stop it.
+`docs/adr/0001-nested-engine-not-host-socket.md` has the full reasoning.
+
+What the run line adds instead (the Dockerfile header covers each):
+
+- `--security-opt seccomp=claude-container/seccomp.json` is Docker's
+  default profile, plus the syscalls a user namespace needs: `unshare`,
+  `setns`, namespaced `clone`, `mount`, `umount2`, `pivot_root`, `keyctl`,
+  `sethostname` and the new mount API. Creating a user namespace needs no
+  capability, so the kernel's user-namespace code is what this opens to
+  the agent. The mount and hostname calls still require `CAP_SYS_ADMIN` in
+  the namespace they act on, and `rob` has that only inside namespaces it
+  creates. `make-seccomp` regenerates the profile from a pinned upstream
+  commit.
+- `-v claude-dev-containers:/home/rob/.local/share/containers` holds
+  podman's images, so they survive `docker rm -f claude-dev`.
+
+Nested containers share the agent container's network and have no cgroup
+limits. A nested container's root is `rob` outside it, so what it writes
+into a mounted `~/projects` directory is owned by `rob` on the Mac. An
+image that runs as a non-root user writes files under a subordinate UID
+instead. Pass `--userns=keep-id` to `docker run` to map that user to
+`rob`.
+
+Images built in here live in the volume, so the Mac's Docker doesn't see
+them. On the Mac, rebuild from the same Dockerfile.
+
+To check it, from inside the container:
+
+    grep CapEff /proc/self/status          # 0000000000000000
+    ls -l /var/run/docker.sock ~/.orbstack 2>&1   # neither exists
+    d=$(mktemp -d ~/projects/nested-check.XXXX)
+    printf 'FROM debian:bookworm-slim\nRUN apt-get update && apt-get install -y --no-install-recommends hello\n' > "$d/Dockerfile"
+    docker build -t nested-check "$d"
+    docker run --rm -v "$d":/out nested-check sh -c 'hello > /out/hi'
+    ls -ln "$d/hi"                        # uid 1000
+    docker ps -a                           # nested-check at most, never mail
+
+On the Mac, check the ownership with `ls -l ~/projects/nested-check.*/hi`.
+Check persistence with `docker rm -f claude-dev`, the run line again, and
+`docker exec claude-dev docker images`, which should still list
+`nested-check`. Check the run line itself with `docker inspect claude-dev
+--format '{{.HostConfig.Privileged}} {{.HostConfig.Devices}}
+{{.HostConfig.Binds}}'`. It should show `false []`, and no bind of a
+docker.sock. Afterwards, remove the scratch directory and run `docker rmi
+nested-check` inside the container.
 
 ## The shared mount: don't let the host run what the agent writes
 

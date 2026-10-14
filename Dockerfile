@@ -7,9 +7,47 @@
 #
 # macOS (OrbStack's docker CLI):
 #   docker build -t claude-dev --build-arg HOST_HOME="$HOME" claude-container
-#   docker run -d --name claude-dev --env-file "$HOME/.config/claude-dev/env" -v "$HOME/projects":"$HOME/projects" -w "$HOME/projects" -v claude-config:/home/rob/.claude claude-dev sleep infinity
+#   docker run -d --name claude-dev --env-file "$HOME/.config/claude-dev/env" --security-opt seccomp=claude-container/seccomp.json -v "$HOME/projects":"$HOME/projects" -w "$HOME/projects" -v claude-config:/home/rob/.claude -v claude-dev-containers:/home/rob/.local/share/containers claude-dev sleep infinity
 #   docker exec -it claude-dev claude     # first run only, to log in
 #   docker exec -it claude-dev zsh        # interactive shell
+#
+# Containers inside the container. Agents build and test images (a project
+# whose run environment is a Dockerfile, say) with `docker build' and `docker
+# run' in here. That `docker' is rootless podman, running as rob, inside this
+# container -- never the Mac's engine. OrbStack's socket is not mounted, and
+# must not be: with it an agent could `docker exec' into the mail container
+# and read its tokens, or start a container mounting the whole home folder.
+# No --privileged and no --device either; rob's processes keep CapEff at
+# zero. docs/adr/0001-nested-engine-not-host-socket.md has the reasoning.
+#
+# What it takes instead is the two extra pieces on the run line:
+#   seccomp.json      Docker's default seccomp profile, plus the syscalls a
+#                     user namespace needs -- unshare, setns, namespaced
+#                     clone, mount and the new mount API, umount2,
+#                     pivot_root, keyctl, sethostname. The default allows
+#                     most of those only to a container holding
+#                     CAP_SYS_ADMIN, which this one doesn't, and keyctl to
+#                     none. What it opens is user namespaces themselves,
+#                     which any user may create: that is the kernel code an
+#                     agent can now reach. The rest stay checked against
+#                     CAP_SYS_ADMIN in the namespace each acts on, and rob
+#                     has that only in the namespaces rob creates -- so
+#                     podman can mount and pivot inside a nested container,
+#                     and still can't touch this container's mounts or
+#                     hostname. The path is
+#                     read by the docker CLI, relative to where you run it,
+#                     like the build context. make-seccomp regenerates it.
+#   claude-dev-containers
+#                     podman's image and container storage. On a volume so
+#                     images survive recreating the container, and because
+#                     overlayfs can't stack its upper layer on this
+#                     container's own overlayfs root.
+# Nested containers share this container's network, so no tun device is
+# needed for slirp4netns or pasta. Their root is rob outside them, so files
+# they write into a mounted ~/projects directory come out owned by rob.
+#
+# The Linux run line has neither piece yet: rootless podman inside rootless
+# podman is a separate piece of work, so there `docker' in here won't run.
 #
 # Linux (rootless podman, not Docker -- see the setup playbook's `podman' tag
 # for why: no root-equivalent `docker' group, and podman's user-space
@@ -200,19 +238,64 @@ RUN apt-get update && apt-get install -y git gh zsh curl \
 ENV LANG=C.UTF-8
 ENV TZ=America/Los_Angeles
 
+# Rootless podman, with podman-docker for the `docker' command, so the
+# `docker build'/`docker run' an agent writes for a project work unchanged
+# here (see the header for why it is a nested engine). uidmap's setuid
+# newuidmap/newgidmap give rob's user namespace the 65536 subordinate IDs
+# useradd allots below; apt-get inside a build needs more than one UID.
+#
+# --no-install-recommends keeps fuse-overlayfs and slirp4netns out. Both
+# need a device (/dev/fuse, /dev/net/tun) this container doesn't get, and
+# podman would pick fuse-overlayfs over the kernel's own overlay just for
+# being installed. Rootless native overlay needs kernel 5.13, which
+# OrbStack's is well past.
+#
+# The config, system-wide since rob is the only user:
+#   netns = "host"    nested containers and build RUN steps share this
+#                     container's network; a private one would need tun
+#   cgroups, cgroup_manager, pids_limit
+#                     /sys/fs/cgroup is read-only in here and there is no
+#                     systemd, so nested containers run without a cgroup
+#                     of their own (and no limits that would need one)
+#   events_logger     a file, journald being absent too
+#   driver = overlay  named, so podman doesn't go looking for a FUSE helper
+#   docker.io as the only short-name registry
+#                     Debian ships the list empty, so `FROM debian:bookworm'
+#                     would fail here and build fine on the Mac
+#   nodocker          silences podman-docker's notice on every call
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      podman podman-docker crun uidmap catatonit \
+    && rm -rf /var/lib/apt/lists/* \
+    && printf '%s\n' '[containers]' 'netns = "host"' 'cgroups = "disabled"' \
+         'pids_limit = 0' '[engine]' 'cgroup_manager = "cgroupfs"' \
+         'events_logger = "file"' 'runtime = "crun"' \
+         > /etc/containers/containers.conf \
+    && printf '%s\n' '[storage]' 'driver = "overlay"' \
+         > /etc/containers/storage.conf \
+    && mkdir -p /etc/containers/registries.conf.d \
+    && printf '%s\n' 'unqualified-search-registries = ["docker.io"]' \
+         > /etc/containers/registries.conf.d/docker-io.conf \
+    && touch /etc/containers/nodocker
+
 COPY --from=emacs-builder /emacs-root/usr/local/ /usr/local/
 
 # The UID is pinned rather than left to Debian's numbering, because the Linux
 # side now depends on its value: --userns=keep-id maps the host user (1000) to
 # the same UID in here, and a mismatch would quietly misown the whole mount.
+#
+# useradd also gives rob subordinate UIDs and GIDs (from login.defs), which
+# rootless podman maps nested containers' users onto. The grep fails the
+# build if a base-image change ever stops that, rather than leaving podman
+# to fail later in a running container.
 ARG USER_UID=1000
-RUN useradd -m -s /bin/zsh -u "${USER_UID}" rob
+RUN useradd -m -s /bin/zsh -u "${USER_UID}" rob \
+    && grep -q '^rob:' /etc/subuid && grep -q '^rob:' /etc/subgid
 USER rob
 WORKDIR /home/rob
 
-# Pre-create the config mountpoint as rob so the named volume
-# inherits correct ownership on first mount (EACCES fix).
-RUN mkdir -p /home/rob/.claude
+# Pre-create the config and podman-storage mountpoints as rob so the named
+# volumes inherit correct ownership on first mount (EACCES fix).
+RUN mkdir -p /home/rob/.claude /home/rob/.local/share/containers
 
 # ~/projects as a convenience alias for the identity mount, which lands at
 # the host's absolute path (/Users/rob on macOS), not under this container's

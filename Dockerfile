@@ -7,7 +7,7 @@
 #
 # macOS (OrbStack's docker CLI):
 #   docker build -t claude-dev --build-arg HOST_HOME="$HOME" claude-container
-#   docker run -d --name claude-dev --env-file "$HOME/.config/claude-dev/env" --security-opt seccomp=claude-container/seccomp.json -v "$HOME/projects":"$HOME/projects" -w "$HOME/projects" -v claude-config:/home/rob/.claude -v claude-dev-containers:/home/rob/.local/share/containers claude-dev sleep infinity
+#   docker run -d --init --name claude-dev --env-file "$HOME/.config/claude-dev/env" --security-opt seccomp=claude-container/seccomp.json -v "$HOME/projects":"$HOME/projects" -w "$HOME/projects" -v claude-config:/home/rob/.claude -v claude-dev-containers:/home/rob/.local/share/containers claude-dev sleep infinity
 #   docker exec -it claude-dev claude     # first run only, to log in
 #   docker exec -it claude-dev zsh        # interactive shell
 #
@@ -20,7 +20,7 @@
 # No --privileged and no --device either; rob's processes keep CapEff at
 # zero. docs/adr/0001-nested-engine-not-host-socket.md has the reasoning.
 #
-# What it takes instead is the two extra pieces on the run line:
+# What it takes instead is the three extra pieces on the run line:
 #   seccomp.json      Docker's default seccomp profile, plus the syscalls a
 #                     user namespace needs -- unshare, setns, namespaced
 #                     clone, mount and the new mount API, umount2,
@@ -37,16 +37,21 @@
 #                     hostname. The path is
 #                     read by the docker CLI, relative to where you run it,
 #                     like the build context. make-seccomp regenerates it.
+#   --init            tini as PID 1 rather than `sleep infinity'. podman's
+#                     conmon double-forks, so each one ends up a child of
+#                     PID 1, and sleep never reaps them: every nested run
+#                     would leave a zombie behind.
 #   claude-dev-containers
 #                     podman's image and container storage. On a volume so
 #                     images survive recreating the container, and because
 #                     overlayfs can't stack its upper layer on this
 #                     container's own overlayfs root.
 # Nested containers share this container's network, so no tun device is
-# needed for slirp4netns or pasta. Their root is rob outside them, so files
-# they write into a mounted ~/projects directory come out owned by rob.
+# needed for slirp4netns or pasta, and its PID namespace, so no fresh /proc
+# has to be mounted under Docker's masks. Their root is rob outside them, so
+# files they write into a mounted ~/projects directory come out owned by rob.
 #
-# The Linux run line has neither piece yet: rootless podman inside rootless
+# The Linux run line has none of these yet: rootless podman inside rootless
 # podman is a separate piece of work, so there `docker' in here won't run.
 #
 # Linux (rootless podman, not Docker -- see the setup playbook's `podman' tag
@@ -240,9 +245,18 @@ ENV TZ=America/Los_Angeles
 
 # Rootless podman, with podman-docker for the `docker' command, so the
 # `docker build'/`docker run' an agent writes for a project work unchanged
-# here (see the header for why it is a nested engine). uidmap's setuid
+# here (see the header for why it is a nested engine). uidmap's
 # newuidmap/newgidmap give rob's user namespace the 65536 subordinate IDs
 # useradd allots below; apt-get inside a build needs more than one UID.
+#
+# They get file capabilities in place of Debian's setuid bit. Writing a
+# uid_map takes CAP_SYS_ADMIN over the new namespace as well as CAP_SETUID
+# over its parent. Setuid root has the second, but not the first: it is no
+# longer the namespace's owner (rob), and this container's bounding set has
+# no CAP_SYS_ADMIN to stand in -- so every podman call failed with "write
+# to uid_map failed". With cap_setuid alone the helper stays rob, owner of
+# the namespace, and the kernel accepts the write. podman's own images ship
+# it the same way. libcap2-bin is just for setcap.
 #
 # --no-install-recommends keeps fuse-overlayfs and slirp4netns out. Both
 # need a device (/dev/fuse, /dev/net/tun) this container doesn't get, and
@@ -253,20 +267,36 @@ ENV TZ=America/Los_Angeles
 # The config, system-wide since rob is the only user:
 #   netns = "host"    nested containers and build RUN steps share this
 #                     container's network; a private one would need tun
-#   cgroups, cgroup_manager, pids_limit
+#   pidns = "host"    likewise this container's PIDs. A private PID
+#                     namespace needs a fresh procfs, and the kernel
+#                     refuses that inside a user namespace while Docker's
+#                     masks sit over parts of this container's /proc --
+#                     crun 1.8 has no fallback. Sharing the PID namespace
+#                     lets crun bind the existing /proc instead, and keeps
+#                     the masks; --security-opt systempaths=unconfined on
+#                     the run line would be the other way out, and lifts
+#                     them. See docs/adr/0001
+#   cgroup_manager, pids_limit
 #                     /sys/fs/cgroup is read-only in here and there is no
-#                     systemd, so nested containers run without a cgroup
-#                     of their own (and no limits that would need one)
+#                     systemd, so nested containers get no cgroup of their
+#                     own (crun skips it) and no limits that would need one
 #   events_logger     a file, journald being absent too
 #   driver = overlay  named, so podman doesn't go looking for a FUSE helper
 #   docker.io as the only short-name registry
 #                     Debian ships the list empty, so `FROM debian:bookworm'
 #                     would fail here and build fine on the Mac
 #   nodocker          silences podman-docker's notice on every call
+#   docker.sock       podman-docker's install leaves /run/docker.sock
+#                     pointing at a rootful podman socket that never runs
+#                     in here. Removed, so the only docker.sock check that
+#                     matters -- "is the host's in here?" -- reads clean
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      podman podman-docker crun uidmap catatonit \
+      podman podman-docker crun uidmap catatonit libcap2-bin \
     && rm -rf /var/lib/apt/lists/* \
-    && printf '%s\n' '[containers]' 'netns = "host"' 'cgroups = "disabled"' \
+    && chmod 0755 /usr/bin/newuidmap /usr/bin/newgidmap \
+    && setcap cap_setuid=ep /usr/bin/newuidmap \
+    && setcap cap_setgid=ep /usr/bin/newgidmap \
+    && printf '%s\n' '[containers]' 'netns = "host"' 'pidns = "host"' \
          'pids_limit = 0' '[engine]' 'cgroup_manager = "cgroupfs"' \
          'events_logger = "file"' 'runtime = "crun"' \
          > /etc/containers/containers.conf \
@@ -275,7 +305,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && mkdir -p /etc/containers/registries.conf.d \
     && printf '%s\n' 'unqualified-search-registries = ["docker.io"]' \
          > /etc/containers/registries.conf.d/docker-io.conf \
-    && touch /etc/containers/nodocker
+    && touch /etc/containers/nodocker \
+    && rm -f /run/docker.sock
 
 COPY --from=emacs-builder /emacs-root/usr/local/ /usr/local/
 

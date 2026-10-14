@@ -26,6 +26,16 @@ no `--privileged`, no devices. Instead it runs its own engine:
 - **Nested containers use the agent container's network** (`netns =
   "host"`). They need no tun device, and their traffic leaves the same way
   the agent's own does.
+- **Nested containers share the agent container's PID namespace**
+  (`pidns = "host"`). A private one needs a fresh procfs mount, which the
+  kernel refuses inside a user namespace while Docker's masks cover parts
+  of the agent container's `/proc`. crun 1.8 doesn't fall back to binding
+  the existing `/proc`. Tried 2026-10-14: `mount proc: Operation not
+  permitted` on every `run` and every build `RUN`.
+- **`newuidmap`/`newgidmap` carry file capabilities, not setuid.** Writing
+  a `uid_map` needs `CAP_SYS_ADMIN` over the new namespace. A setuid-root
+  helper isn't the namespace's owner, and the agent container's bounding
+  set has no `CAP_SYS_ADMIN`, so the kernel refused it.
 - **Image storage on a named volume**, `claude-dev-containers`, so images
   survive recreating the container. It also gives overlayfs a real
   filesystem to sit on.
@@ -50,12 +60,14 @@ no `--privileged`, no devices. Instead it runs its own engine:
   container's own mounts, hostname or network. `keyctl` reaches the kernel
   keyring, which Docker keeps closed because keyrings aren't namespaced;
   crun needs it for each nested container's session keyring.
-- Docker masks parts of `/proc` in the agent container, and the kernel then
-  refuses a fresh procfs mount inside a user namespace. A nested container
-  depends on crun falling back to bind-mounting the agent container's
-  `/proc`. If that fallback fails, `--security-opt systempaths=unconfined`
-  on the run line would fix it, but it unmasks those paths. Adding it is a
-  decision to record here, not a quick fix.
+- A nested container's entrypoint isn't PID 1. It can see the agent's
+  processes, which run as the same user anyway, and `ps` inside it lists
+  them. conmon reaps its orphans. An image that insists on being PID 1
+  (s6-overlay, systemd as init) won't start. If one is needed, the way
+  out is `--security-opt systempaths=unconfined` on the run line plus a
+  private `pidns`. That unmasks `/proc/kcore`, `/proc/keys`,
+  `/proc/timer_list` and the rest in the agent container, so it is a
+  decision to record here.
 - Nested containers have no cgroup of their own: `/sys/fs/cgroup` is
   read-only in the agent container. So there are no CPU, memory or PID
   limits on them, and `docker stats` reports nothing.

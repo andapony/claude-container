@@ -150,9 +150,12 @@ What the run line adds instead (the Dockerfile header covers each):
   commit.
 - `-v claude-dev-containers:/home/rob/.local/share/containers` holds
   podman's images, so they survive `docker rm -f claude-dev`.
+- `--init` makes tini PID 1, so the conmon processes podman leaves behind
+  get reaped instead of piling up as zombies under `sleep infinity`.
 
-Nested containers share the agent container's network and have no cgroup
-limits. A nested container's root is `rob` outside it, so what it writes
+Nested containers share the agent container's network and PID namespace
+(so their entrypoint isn't PID 1), and have no cgroup limits. A nested
+container's root is `rob` outside it, so what it writes
 into a mounted `~/projects` directory is owned by `rob` on the Mac. An
 image that runs as a non-root user writes files under a subordinate UID
 instead. Pass `--userns=keep-id` to `docker run` to map that user to

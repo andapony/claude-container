@@ -1,8 +1,9 @@
 # Limiting what the agent can do outside the container
 
 The container is the boundary, but two things cross it: whatever GitHub
-credential is passed in, and the `~/projects` mount, which the host reads
-and writes too. This covers how to keep both from widening what the agent
+credential is passed in, and the mounted directory -- `~/projects` for
+`claude-dev`, `~/cetos` for `claude-cetos` -- which the host reads and
+writes too. This covers how to keep both from widening what the agent
 can do, and how agents get to build and run images without being given
 a third thing: the host's container engine.
 
@@ -112,6 +113,138 @@ the only real test would delete a repo. For pushing, use
 `git push --dry-run origin HEAD:refs/heads/x`, which authenticates for
 push but sends nothing.
 
+## claude-cetos: Cetos work, apart from personal work
+
+`claude-cetos` is a second container from the same Dockerfile, for Cetos
+repos only; the Dockerfile header has its build and run lines. It differs
+from `claude-dev` in what it can reach, and in nothing else:
+
+| | `claude-dev` | `claude-cetos` |
+|---|---|---|
+| mounts | `~/projects` | `~/cetos`, and never `~/projects` |
+| env file | `~/.config/claude-dev/env` | `~/.config/claude-cetos/env` |
+| `GH_TOKEN` owned by | `andapony` | `robcetos`, for the Cetos org |
+| other tokens | none | optionally `GH_TOKEN_EMACS_D` |
+| Claude login volume | `claude-config` | `claude-cetos-config` |
+| podman storage volume | `claude-dev-containers` | `claude-cetos-containers` |
+| commits as | `andapony@...` | the Cetos address (`GIT_USER_EMAIL`) |
+
+### Never mount ~/projects
+
+The mount is what keeps the two apart. Never add a `~/projects` mount, or
+any directory holding a personal repo other than `emacs.d`, to
+`claude-cetos`, and never mount `~/cetos` in `claude-dev`. Cetos repos live
+in `~/cetos/`, outside `~/projects`, so `claude-dev` never sees them; and
+`claude-cetos` sees nothing of `~/projects`, so an agent on the company's
+Claude account, holding a Cetos token, can't read or write personal work.
+It has no `~/projects` alias inside either: `MOUNT_DIR=cetos` gives it
+`~/cetos` instead. The container map then sends `~/cetos` to
+`claude-cetos`, so host git runs there too.
+
+To check, on the host:
+
+    docker inspect claude-cetos --format '{{.HostConfig.Binds}} {{.Config.WorkingDir}}'
+
+It should list `$HOME/cetos` and no `projects`. Inside, `ls ~/projects`
+should fail.
+
+### Its GH_TOKEN: owned by robcetos
+
+Make the token as above, signed in to GitHub as `robcetos`, with two
+differences:
+
+- **Resource owner:** the Cetos organisation, not `robcetos` itself. A
+  fine-grained token reaches an organisation's repos only if the
+  organisation allows fine-grained tokens (organisation → Settings →
+  Personal access tokens), and the organisation may require an owner to
+  approve each one: until then the token is "pending" and every request
+  to the org's repos fails as if it had no access.
+- **Repository access:** the Cetos repos to work on, or all of them.
+
+The repository permissions are the same as `claude-dev`'s: Contents, Pull
+requests and Issues read and write, Metadata read, nothing else -- no
+Administration, no Workflows -- and no account permissions.
+
+Put it in its own env file, so it never reaches `claude-dev`:
+
+    mkdir -p ~/.config/claude-cetos
+    ( umask 077; printf 'GH_TOKEN=%s\n' '<token>' > ~/.config/claude-cetos/env )
+
+Check it from inside `claude-cetos` with the same probes, where `<you>`
+is the Cetos organisation and `<repo>` one of its repos: the first five
+403, the last three 422. Then check what it can't reach, which is the
+point of a separate token -- every personal repo:
+
+    probe 'file, andapony repo' -X PUT /repos/andapony/emacs.d/contents/x.txt -f message=x
+    probe 'issue, andapony repo' -X POST /repos/andapony/emacs.d/issues -f body=
+    gh api user --jq .login              # robcetos
+
+Both should be 403 (404 for a private repo). Being public, `emacs.d` can
+still be read.
+
+### A token for one repo: GH_TOKEN_EMACS_D
+
+On a work machine `emacs.d` lives in `~/cetos/emacs.d`, so that
+`claude-cetos` can work on it, but `robcetos`'s token can't push it. So
+`claude-cetos`'s env file can carry a second token, for that repo alone:
+
+- **Owner and resource owner:** `andapony`.
+- **Repository access:** only `andapony/emacs.d`.
+- **Repository permissions:** Contents read and write, and Metadata read
+  (required). Nothing else -- no Issues, no Pull requests.
+- **Account permissions:** none. **Expiration:** set one.
+
+Add it to the env file, beside `GH_TOKEN`, then recreate the container:
+
+    ( umask 077; printf 'GH_TOKEN_EMACS_D=%s\n' '<token>' >> ~/.config/claude-cetos/env )
+
+Only git uses it, and only for `https://github.com/andapony/emacs.d`
+(with or without `.git`, so the rewritten SSH remote is covered too). The
+image's `git-credential-repo-token` is that URL's credential helper,
+answering with `GH_TOKEN_EMACS_D` ahead of `gh`; for every other URL `gh`
+answers with `GH_TOKEN` as before. `gh` itself only ever reads
+`GH_TOKEN`, so `gh pr create` and the like on `emacs.d` act as `robcetos`,
+and fail. Without the variable the helper says nothing and `gh` answers,
+exactly as if it weren't there -- which is why the same entry in
+`claude-dev` changes nothing. `tests/repo-token-test.sh` checks which token
+git picks for which URL, with and without the variable: run `sh
+tests/repo-token-test.sh`. The Dockerfile's `--add` line is where another
+repo would get an entry of its own.
+
+To check, from inside `claude-cetos`:
+
+    cd ~/cetos/emacs.d
+    git push --dry-run origin HEAD:refs/heads/x   # authenticates, sends nothing
+    printf 'url=https://github.com/andapony/emacs.d\n\n' | git credential fill \
+      | grep -q "password=$GH_TOKEN_EMACS_D" && echo emacs.d token
+    printf 'url=https://github.com/andapony/setup\n\n' | git credential fill \
+      | grep -q "password=$GH_TOKEN" && echo GH_TOKEN
+    gh api user --jq .login                       # robcetos, not andapony
+
+And probe the token itself, by handing it to `gh` for these requests
+only:
+
+    GH_TOKEN=$GH_TOKEN_EMACS_D probe 'file, emacs.d'    -X PUT /repos/andapony/emacs.d/contents/x.txt -f message=x
+    GH_TOKEN=$GH_TOKEN_EMACS_D probe 'workflow, emacs.d' -X PUT /repos/andapony/emacs.d/contents/.github/workflows/x.yml -f message=x
+    GH_TOKEN=$GH_TOKEN_EMACS_D probe 'issue, emacs.d'   -X POST /repos/andapony/emacs.d/issues -f body=
+    GH_TOKEN=$GH_TOKEN_EMACS_D probe 'file, other repo' -X PUT /repos/andapony/<repo>/contents/x.txt -f message=x
+    GH_TOKEN=$GH_TOKEN_EMACS_D probe 'create repo'      -X POST /user/repos -f name=
+
+The first should be 422, the rest 403 (404 for a private repo).
+
+The token can push `emacs.d` from an agent on the company's Claude
+account. That is accepted: it is less than `claude-dev`'s token reaches,
+and the ruleset on `emacs.d`'s `main` blocks force-pushes and deletion.
+
+### Switching claude-cetos's Claude login
+
+Its login lives in `claude-cetos-config`, apart from `claude-dev`'s. Log in
+with `docker exec -it claude-cetos claude`, then `/login`. To switch
+account -- on MrMustard it starts on the personal one, until the
+company's arrives -- do the same again and `/login` as the other: the new
+login replaces the old. Restart any open agent-shell session in `~/cetos`
+afterwards, so it starts on the new login.
+
 ### Claude Code deny rules
 
 These rules in `~/.claude/settings.json` catch mistakes, but they are not a
@@ -149,7 +282,8 @@ What the run line adds instead (the Dockerfile header covers each):
   creates. `make-seccomp` regenerates the profile from a pinned upstream
   commit.
 - `-v claude-dev-containers:/home/rob/.local/share/containers` holds
-  podman's images, so they survive `docker rm -f claude-dev`.
+  podman's images, so they survive `docker rm -f claude-dev`
+  (`claude-cetos-containers` for `claude-cetos`).
 - `--init` makes tini PID 1, so the conmon processes podman leaves behind
   get reaped instead of piling up as zombies under `sleep infinity`.
 

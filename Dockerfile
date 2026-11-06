@@ -1,15 +1,39 @@
 # Claude Code + agent-shell dev container
 #
 # The runtime differs by platform: Docker on macOS, rootless podman on Linux.
-# Both mount ~/projects at the same absolute path inside and out, so no path
-# translation is needed anywhere — agent-shell, compile output, diffs, and
-# transcripts all reference host-valid paths.
+# Each container mounts its one directory at the same absolute path inside
+# and out, so no path translation is needed anywhere — agent-shell, compile
+# output, diffs, and transcripts all reference host-valid paths.
+#
+# Two containers are built from this file, each its own image:
+#   claude-dev     personal work: mounts ~/projects, GH_TOKEN owned by andapony
+#   claude-cetos   Cetos work: mounts ~/cetos and never ~/projects, GH_TOKEN
+#                  owned by robcetos, commits as the Cetos address
+# Each has its own Claude login volume, podman storage volume and env file,
+# so neither can see the other's repos, token or login. AGENT-ACCESS.md
+# covers both tokens. Which container a host directory belongs to is the
+# container map, ~/.config/claude-container/containers (see container-git).
 #
 # macOS (OrbStack's docker CLI):
 #   docker build -t claude-dev --build-arg HOST_HOME="$HOME" claude-container
 #   docker run -d --init --name claude-dev --env-file "$HOME/.config/claude-dev/env" --security-opt seccomp=claude-container/seccomp.json -v "$HOME/projects":"$HOME/projects" -w "$HOME/projects" -v claude-config:/home/rob/.claude -v claude-dev-containers:/home/rob/.local/share/containers claude-dev sleep infinity
 #   docker exec -it claude-dev claude     # first run only, to log in
 #   docker exec -it claude-dev zsh        # interactive shell
+#
+# claude-cetos on macOS. The Cetos address is not written here, because this
+# repo is public: set CETOS_EMAIL to it in the shell first, and the build
+# refuses to start without it.
+#   docker build -t claude-cetos --build-arg HOST_HOME="$HOME" --build-arg MOUNT_DIR=cetos --build-arg GIT_USER_EMAIL="${CETOS_EMAIL:?the Cetos address}" --build-arg GITHUB_SSH_ALIAS=github-robcetos claude-container
+#   docker run -d --init --name claude-cetos --env-file "$HOME/.config/claude-cetos/env" --security-opt seccomp=claude-container/seccomp.json -v "$HOME/cetos":"$HOME/cetos" -w "$HOME/cetos" -v claude-cetos-config:/home/rob/.claude -v claude-cetos-containers:/home/rob/.local/share/containers claude-cetos sleep infinity
+#   docker exec -it claude-cetos claude   # then /login, to log in
+#   docker exec -it claude-cetos zsh      # interactive shell
+#
+# Its Claude login is whichever account /login was last given, kept in
+# claude-cetos-config. To switch accounts -- MrMustard starts on the
+# personal one, until the company's arrives -- run `docker exec -it
+# claude-cetos claude' again and /login as the other: the new login
+# replaces the old one in the volume. Then restart any open agent-shell
+# session in ~/cetos, so it starts on the new login.
 #
 # Containers inside the container. Agents build and test images (a project
 # whose run environment is a Dockerfile, say) with `docker build' and `docker
@@ -41,7 +65,7 @@
 #                     conmon double-forks, so each one ends up a child of
 #                     PID 1, and sleep never reaps them: every nested run
 #                     would leave a zombie behind.
-#   claude-dev-containers
+#   claude-dev-containers (claude-cetos-containers)
 #                     podman's image and container storage. On a volume so
 #                     images survive recreating the container, and because
 #                     overlayfs can't stack its upper layer on this
@@ -49,7 +73,8 @@
 # Nested containers share this container's network, so no tun device is
 # needed for slirp4netns or pasta, and its PID namespace, so no fresh /proc
 # has to be mounted under Docker's masks. Files they write into a mounted
-# ~/projects directory come out owned by rob on the Mac, as whatever user:
+# ~/projects (or ~/cetos) directory come out owned by rob on the Mac, as
+# whatever user:
 # OrbStack's file sharing records every write as the Mac user.
 #
 # The Linux run line has none of these yet: rootless podman inside rootless
@@ -63,6 +88,12 @@
 #   podman run -d --name claude-dev --userns=keep-id --env-file "$HOME/.config/claude-dev/env" -v "$HOME/projects":"$HOME/projects" -w "$HOME/projects" -v claude-config:/home/rob/.claude:U claude-dev sleep infinity
 #   podman exec -it claude-dev claude     # first run only, to log in
 #   podman exec -it claude-dev zsh        # interactive shell
+#
+# claude-cetos on Linux, with CETOS_EMAIL set as above:
+#   podman build --format docker -t claude-cetos --build-arg HOST_HOME="$HOME" --build-arg MOUNT_DIR=cetos --build-arg GIT_USER_EMAIL="${CETOS_EMAIL:?the Cetos address}" --build-arg GITHUB_SSH_ALIAS=github-robcetos claude-container
+#   podman run -d --name claude-cetos --userns=keep-id --env-file "$HOME/.config/claude-cetos/env" -v "$HOME/cetos":"$HOME/cetos" -w "$HOME/cetos" -v claude-cetos-config:/home/rob/.claude:U claude-cetos sleep infinity
+#   podman exec -it claude-cetos claude   # then /login, to log in
+#   podman exec -it claude-cetos zsh      # interactive shell
 #
 # Why the Linux invocation carries three extra pieces:
 #   --format docker   podman defaults to the OCI image format, which has no
@@ -112,7 +143,9 @@
 #
 # Notes:
 #   - The mount is the entire host-visibility policy: everything
-#     under ~/projects is in scope for every session. For untrusted
+#     under the mounted directory (~/projects, or ~/cetos) is in scope
+#     for every session. claude-cetos must never mount ~/projects: the
+#     separation of Cetos work from personal work is that mount. For untrusted
 #     or unattended (--dangerously-skip-permissions) work, prefer a
 #     separate narrow container mounting a throwaway clone only.
 #   - -w is just the default for the interactive `exec` shells above;

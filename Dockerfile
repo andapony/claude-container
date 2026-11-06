@@ -117,8 +117,11 @@
 #   - Emacs is a terminal build (no X/GUI): it is here for in-container
 #     `emacs -nw`, batch/ert runs, and as the TRAMP-side remote Emacs.
 #   - --env-file supplies GH_TOKEN, the container's only GitHub credential:
-#     a fine-grained token, one `GH_TOKEN=...' line, kept outside ~/projects
-#     and mode 600. The file must exist or `run' fails; create it first.
+#     a fine-grained token, one `GH_TOKEN=...' line, kept outside every
+#     mounted directory and mode 600. claude-cetos's may add a second,
+#     GH_TOKEN_EMACS_D, which git alone uses, for andapony/emacs.d only
+#     (see git-credential-repo-token below). The file must exist or `run'
+#     fails; create it first.
 #     Env is fixed at `run', so a new token means recreating the container.
 #     gh prefers GH_TOKEN to a stored login, and git reaches it through the
 #     credential helper set up below. Don't `gh auth login' in here: that
@@ -455,6 +458,22 @@ ENV CHROMIUM_PATH=/usr/bin/chromium
 # an HTML page it produced. Page-specific checks stay in the page's own repo.
 # The file's mode is committed executable; COPY keeps it.
 COPY page-shot /usr/local/bin/page-shot
+
+# A repo with a token of its own: git-credential-repo-token's commentary has
+# how. claude-cetos's GH_TOKEN belongs to robcetos, which can't reach
+# andapony/emacs.d, yet that repo lives in ~/cetos on a work machine; so
+# GH_TOKEN_EMACS_D, in the same env file, is an andapony token for it
+# alone. git uses it for that URL only, and gh never does. Without the
+# variable the helper says nothing and gh answers, as before -- so the entry
+# is in every image built here, claude-dev's included, and does nothing
+# where the variable isn't set.
+#
+# It is written after the github.com helper above, because git applies
+# matching credential sections in file order. Down here, not beside that
+# helper, so changing the script rebuilds only these last layers. Another
+# repo is one more --add line, with a variable of its own.
+COPY git-credential-repo-token /usr/local/bin/git-credential-repo-token
+RUN git-credential-repo-token --add https://github.com/andapony/emacs.d GH_TOKEN_EMACS_D
 
 # The bundled binary carries its own updater. Letting it self-update
 # would desync it from the SDK release that pins it -- the pairing the

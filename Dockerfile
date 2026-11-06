@@ -82,6 +82,8 @@
 # HOST_HOME is passed on both, but does opposite things: on macOS it is the
 # /Users/rob the ~/projects alias points at, and on Linux it is /home/rob,
 # which suppresses that alias entirely because the mount already lands there.
+# MOUNT_DIR names the mounted directory under it, for the same alias:
+# projects by default, cetos for claude-cetos.
 #
 # Build knobs (all optional):
 #   --build-arg NATIVE_COMP=yes    # lazy nativecomp; much faster image build
@@ -90,6 +92,9 @@
 #                                  # so bumping the version alone fails loudly
 #   --build-arg HOST_HOME=/home/you # where the host's home is, for the
 #                                  # ~/projects alias (default /Users/rob)
+#   --build-arg MOUNT_DIR=cetos     # the directory under HOST_HOME the run
+#                                  # line mounts, for the same alias
+#                                  # (default projects)
 #   --build-arg GIT_USER_EMAIL=... --build-arg GIT_USER_NAME=...
 #                                  # identity for commits made in here
 #                                  # (default Rob Duncan andapony@…)
@@ -334,7 +339,9 @@ RUN mkdir -p /home/rob/.claude /home/rob/.local/share/containers
 
 # ~/projects as a convenience alias for the identity mount, which lands at
 # the host's absolute path (/Users/rob on macOS), not under this container's
-# /home/rob. Typing aid only: /Users/rob/projects stays the canonical
+# /home/rob. MOUNT_DIR is the mounted directory's name, so claude-cetos's
+# alias is ~/cetos, and it has no ~/projects at all, not even a dangling
+# link. Typing aid only: /Users/rob/projects stays the canonical
 # spelling, because it is the one valid on both sides of the mount. Paths
 # that leave the container -- diffs, compile output, transcripts -- should
 # resolve to it, or the host cannot open what they name.
@@ -349,8 +356,9 @@ RUN mkdir -p /home/rob/.claude /home/rob/.local/share/containers
 # Safe as a plain `ln -s' otherwise: /home/rob is freshly created, so there is
 # no existing directory for the link to be created inside of instead.
 ARG HOST_HOME=/Users/rob
-RUN if [ "${HOST_HOME}/projects" != "/home/rob/projects" ]; then \
-        ln -s "${HOST_HOME}/projects" /home/rob/projects; \
+ARG MOUNT_DIR=projects
+RUN if [ "${HOST_HOME}/${MOUNT_DIR}" != "/home/rob/${MOUNT_DIR}" ]; then \
+        ln -s "${HOST_HOME}/${MOUNT_DIR}" "/home/rob/${MOUNT_DIR}"; \
     fi
 
 # Git identity. Without it `git commit' in here fails outright ("Author

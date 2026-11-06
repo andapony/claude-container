@@ -1,15 +1,39 @@
 # Claude Code + agent-shell dev container
 #
 # The runtime differs by platform: Docker on macOS, rootless podman on Linux.
-# Both mount ~/projects at the same absolute path inside and out, so no path
-# translation is needed anywhere — agent-shell, compile output, diffs, and
-# transcripts all reference host-valid paths.
+# Each container mounts its one directory at the same absolute path inside
+# and out, so no path translation is needed anywhere — agent-shell, compile
+# output, diffs, and transcripts all reference host-valid paths.
+#
+# Two containers are built from this file, each its own image:
+#   claude-dev     personal work: mounts ~/projects, GH_TOKEN owned by andapony
+#   claude-cetos   Cetos work: mounts ~/cetos and never ~/projects, GH_TOKEN
+#                  owned by robcetos, commits as the Cetos address
+# Each has its own Claude login volume, podman storage volume and env file,
+# so neither can see the other's repos, token or login. AGENT-ACCESS.md
+# covers both tokens. Which container a host directory belongs to is the
+# container map, ~/.config/claude-container/containers (see container-git).
 #
 # macOS (OrbStack's docker CLI):
 #   docker build -t claude-dev --build-arg HOST_HOME="$HOME" claude-container
 #   docker run -d --init --name claude-dev --env-file "$HOME/.config/claude-dev/env" --security-opt seccomp=claude-container/seccomp.json -v "$HOME/projects":"$HOME/projects" -w "$HOME/projects" -v claude-config:/home/rob/.claude -v claude-dev-containers:/home/rob/.local/share/containers claude-dev sleep infinity
 #   docker exec -it claude-dev claude     # first run only, to log in
 #   docker exec -it claude-dev zsh        # interactive shell
+#
+# claude-cetos on macOS. The Cetos address is not written here, because this
+# repo is public: set CETOS_EMAIL to it in the shell first, and the build
+# refuses to start without it.
+#   docker build -t claude-cetos --build-arg HOST_HOME="$HOME" --build-arg MOUNT_DIR=cetos --build-arg GIT_USER_EMAIL="${CETOS_EMAIL:?the Cetos address}" --build-arg GITHUB_SSH_ALIAS=github-robcetos claude-container
+#   docker run -d --init --name claude-cetos --env-file "$HOME/.config/claude-cetos/env" --security-opt seccomp=claude-container/seccomp.json -v "$HOME/cetos":"$HOME/cetos" -w "$HOME/cetos" -v claude-cetos-config:/home/rob/.claude -v claude-cetos-containers:/home/rob/.local/share/containers claude-cetos sleep infinity
+#   docker exec -it claude-cetos claude   # then /login, to log in
+#   docker exec -it claude-cetos zsh      # interactive shell
+#
+# Its Claude login is whichever account /login was last given, kept in
+# claude-cetos-config. To switch accounts -- MrMustard starts on the
+# personal one, until the company's arrives -- run `docker exec -it
+# claude-cetos claude' again and /login as the other: the new login
+# replaces the old one in the volume. Then restart any open agent-shell
+# session in ~/cetos, so it starts on the new login.
 #
 # Containers inside the container. Agents build and test images (a project
 # whose run environment is a Dockerfile, say) with `docker build' and `docker
@@ -41,7 +65,7 @@
 #                     conmon double-forks, so each one ends up a child of
 #                     PID 1, and sleep never reaps them: every nested run
 #                     would leave a zombie behind.
-#   claude-dev-containers
+#   claude-dev-containers (claude-cetos-containers)
 #                     podman's image and container storage. On a volume so
 #                     images survive recreating the container, and because
 #                     overlayfs can't stack its upper layer on this
@@ -49,7 +73,8 @@
 # Nested containers share this container's network, so no tun device is
 # needed for slirp4netns or pasta, and its PID namespace, so no fresh /proc
 # has to be mounted under Docker's masks. Files they write into a mounted
-# ~/projects directory come out owned by rob on the Mac, as whatever user:
+# ~/projects (or ~/cetos) directory come out owned by rob on the Mac, as
+# whatever user:
 # OrbStack's file sharing records every write as the Mac user.
 #
 # The Linux run line has none of these yet: rootless podman inside rootless
@@ -63,6 +88,12 @@
 #   podman run -d --name claude-dev --userns=keep-id --env-file "$HOME/.config/claude-dev/env" -v "$HOME/projects":"$HOME/projects" -w "$HOME/projects" -v claude-config:/home/rob/.claude:U claude-dev sleep infinity
 #   podman exec -it claude-dev claude     # first run only, to log in
 #   podman exec -it claude-dev zsh        # interactive shell
+#
+# claude-cetos on Linux, with CETOS_EMAIL set as above:
+#   podman build --format docker -t claude-cetos --build-arg HOST_HOME="$HOME" --build-arg MOUNT_DIR=cetos --build-arg GIT_USER_EMAIL="${CETOS_EMAIL:?the Cetos address}" --build-arg GITHUB_SSH_ALIAS=github-robcetos claude-container
+#   podman run -d --name claude-cetos --userns=keep-id --env-file "$HOME/.config/claude-cetos/env" -v "$HOME/cetos":"$HOME/cetos" -w "$HOME/cetos" -v claude-cetos-config:/home/rob/.claude:U claude-cetos sleep infinity
+#   podman exec -it claude-cetos claude   # then /login, to log in
+#   podman exec -it claude-cetos zsh      # interactive shell
 #
 # Why the Linux invocation carries three extra pieces:
 #   --format docker   podman defaults to the OCI image format, which has no
@@ -82,6 +113,8 @@
 # HOST_HOME is passed on both, but does opposite things: on macOS it is the
 # /Users/rob the ~/projects alias points at, and on Linux it is /home/rob,
 # which suppresses that alias entirely because the mount already lands there.
+# MOUNT_DIR names the mounted directory under it, for the same alias:
+# projects by default, cetos for claude-cetos.
 #
 # Build knobs (all optional):
 #   --build-arg NATIVE_COMP=yes    # lazy nativecomp; much faster image build
@@ -90,6 +123,9 @@
 #                                  # so bumping the version alone fails loudly
 #   --build-arg HOST_HOME=/home/you # where the host's home is, for the
 #                                  # ~/projects alias (default /Users/rob)
+#   --build-arg MOUNT_DIR=cetos     # the directory under HOST_HOME the run
+#                                  # line mounts, for the same alias
+#                                  # (default projects)
 #   --build-arg GIT_USER_EMAIL=... --build-arg GIT_USER_NAME=...
 #                                  # identity for commits made in here
 #                                  # (default Rob Duncan andapony@…)
@@ -107,7 +143,9 @@
 #
 # Notes:
 #   - The mount is the entire host-visibility policy: everything
-#     under ~/projects is in scope for every session. For untrusted
+#     under the mounted directory (~/projects, or ~/cetos) is in scope
+#     for every session. claude-cetos must never mount ~/projects: the
+#     separation of Cetos work from personal work is that mount. For untrusted
 #     or unattended (--dangerously-skip-permissions) work, prefer a
 #     separate narrow container mounting a throwaway clone only.
 #   - -w is just the default for the interactive `exec` shells above;
@@ -117,8 +155,11 @@
 #   - Emacs is a terminal build (no X/GUI): it is here for in-container
 #     `emacs -nw`, batch/ert runs, and as the TRAMP-side remote Emacs.
 #   - --env-file supplies GH_TOKEN, the container's only GitHub credential:
-#     a fine-grained token, one `GH_TOKEN=...' line, kept outside ~/projects
-#     and mode 600. The file must exist or `run' fails; create it first.
+#     a fine-grained token, one `GH_TOKEN=...' line, kept outside every
+#     mounted directory and mode 600. claude-cetos's may add a second,
+#     GH_TOKEN_EMACS_D, which git alone uses, for andapony/emacs.d only
+#     (see git-credential-repo-token below). The file must exist or `run'
+#     fails; create it first.
 #     Env is fixed at `run', so a new token means recreating the container.
 #     gh prefers GH_TOKEN to a stored login, and git reaches it through the
 #     credential helper set up below. Don't `gh auth login' in here: that
@@ -331,7 +372,9 @@ RUN mkdir -p /home/rob/.claude /home/rob/.local/share/containers
 
 # ~/projects as a convenience alias for the identity mount, which lands at
 # the host's absolute path (/Users/rob on macOS), not under this container's
-# /home/rob. Typing aid only: /Users/rob/projects stays the canonical
+# /home/rob. MOUNT_DIR is the mounted directory's name, so claude-cetos's
+# alias is ~/cetos, and it has no ~/projects at all, not even a dangling
+# link. Typing aid only: /Users/rob/projects stays the canonical
 # spelling, because it is the one valid on both sides of the mount. Paths
 # that leave the container -- diffs, compile output, transcripts -- should
 # resolve to it, or the host cannot open what they name.
@@ -346,8 +389,9 @@ RUN mkdir -p /home/rob/.claude /home/rob/.local/share/containers
 # Safe as a plain `ln -s' otherwise: /home/rob is freshly created, so there is
 # no existing directory for the link to be created inside of instead.
 ARG HOST_HOME=/Users/rob
-RUN if [ "${HOST_HOME}/projects" != "/home/rob/projects" ]; then \
-        ln -s "${HOST_HOME}/projects" /home/rob/projects; \
+ARG MOUNT_DIR=projects
+RUN if [ "${HOST_HOME}/${MOUNT_DIR}" != "/home/rob/${MOUNT_DIR}" ]; then \
+        ln -s "${HOST_HOME}/${MOUNT_DIR}" "/home/rob/${MOUNT_DIR}"; \
     fi
 
 # Git identity. Without it `git commit' in here fails outright ("Author
@@ -455,6 +499,22 @@ ENV CHROMIUM_PATH=/usr/bin/chromium
 # an HTML page it produced. Page-specific checks stay in the page's own repo.
 # The file's mode is committed executable; COPY keeps it.
 COPY page-shot /usr/local/bin/page-shot
+
+# A repo with a token of its own: git-credential-repo-token's commentary has
+# how. claude-cetos's GH_TOKEN belongs to robcetos, which can't reach
+# andapony/emacs.d, yet that repo lives in ~/cetos on a work machine; so
+# GH_TOKEN_EMACS_D, in the same env file, is an andapony token for it
+# alone. git uses it for that URL only, and gh never does. Without the
+# variable the helper says nothing and gh answers, as before -- so the entry
+# is in every image built here, claude-dev's included, and does nothing
+# where the variable isn't set.
+#
+# It is written after the github.com helper above, because git applies
+# matching credential sections in file order. Down here, not beside that
+# helper, so changing the script rebuilds only these last layers. Another
+# repo is one more --add line, with a variable of its own.
+COPY git-credential-repo-token /usr/local/bin/git-credential-repo-token
+RUN git-credential-repo-token --add https://github.com/andapony/emacs.d GH_TOKEN_EMACS_D
 
 # The bundled binary carries its own updater. Letting it self-update
 # would desync it from the SDK release that pins it -- the pairing the

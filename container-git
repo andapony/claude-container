@@ -1,5 +1,5 @@
 #!/bin/sh
-# container-git -- run git inside the claude-dev container, from the host.
+# container-git -- run git inside the agent container that owns the repo.
 #
 #   container-git <git args...>
 #
@@ -17,18 +17,59 @@
 # emacsclient, which the container lacks; nil with-editor-emacsclient-executable
 # makes it use the sleeping editor, which works through process output instead.
 #
-# Outside ~/projects the container can't see the repo, and the agent can't
-# write to it, so git runs here as usual. Inside, a stopped container is an
-# error, never a quiet fallback to the host's git.
+# Which container owns a directory is the container map,
+# ~/.config/claude-container/containers: one "DIRECTORY CONTAINER" line per
+# entry, ~ standing for $HOME, blank lines and # comments ignored. The longest
+# DIRECTORY containing the cwd wins. Without the file the map is the single
+# entry "~/projects claude-dev".
 #
-# CLAUDE_CONTAINER and CONTAINER_RUNTIME pick another container, or podman.
+# A directory no entry owns is one no container can see, and no agent can
+# write, so git runs here as usual. An owned one never falls back to the
+# host's git: a stopped container is an error.
+#
+# CLAUDE_CONTAINER, if set, replaces whichever container the map chose; it
+# never sends an unowned directory into a container. CONTAINER_RUNTIME picks
+# podman instead of docker.
+
+# The physical form of directory $1, or $1 itself when it does not exist.
+physical() {
+  (cd -P -- "$1" 2>/dev/null && pwd -P) || printf '%s\n' "$1"
+}
+
+# The container owning directory $1, from the map; empty if none does.
+owner() {
+  map="$HOME/.config/claude-container/containers"
+  if [ ! -f "$map" ]; then
+    case "$1/" in
+      "$(physical "$HOME/projects")/"*) echo claude-dev ;;
+    esac
+    return
+  fi
+  best= best_len=-1
+  # The || catches a last line with no newline.
+  while read -r d c _ || [ -n "$d" ]; do
+    case "$d" in
+      ''|'#'*) continue ;;
+      '~') d=$HOME ;;
+      '~/'*) d=$HOME/${d#'~/'} ;;
+    esac
+    [ -n "$c" ] || continue
+    d=$(physical "$d")
+    [ "$d" = / ] || d=${d%/}
+    case "$1/" in
+      "${d%/}/"*)
+        if [ "${#d}" -gt "$best_len" ]; then
+          best=$c best_len=${#d}
+        fi ;;
+    esac
+  done < "$map"
+  printf '%s' "$best"
+}
 
 dir=$(pwd -P)
-case "$dir/" in
-  "$HOME/projects/"*) ;;
-  *) exec git "$@" ;;
-esac
-set -- "${CLAUDE_CONTAINER:-claude-dev}" git "$@"
+container=$(owner "$dir")
+[ -n "$container" ] || exec git "$@"
+set -- "${CLAUDE_CONTAINER:-$container}" git "$@"
 for v in $(env | sed -n 's/^\(GIT_[A-Za-z0-9_]*\)=.*/\1/p'); do
   set -- -e "$v" "$@"
 done

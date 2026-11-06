@@ -217,8 +217,40 @@ So run the host's git inside the container. The mount lands at the same
 absolute path on both sides, so a wrapper only has to carry the working
 directory and Magit's `GIT_*` variables across. That wrapper is
 `container-git`, in this repo; it is for the host only, and the image
-doesn't copy it. Repos outside `~/projects` -- which the container can't
-see and the agent can't write -- it hands to the host's git unchanged.
+doesn't copy it. Repos that no container mounts -- which no agent can
+see or write -- it hands to the host's git unchanged.
+
+#### Which container: the container map
+
+A host can run more than one agent container, each mounting its own
+directory: `claude-dev` with `~/projects`, say, and a work container with
+`~/work`. The **container map**, `~/.config/claude-container/containers`,
+says which container owns which directory, one entry per line:
+
+    # DIRECTORY  CONTAINER
+    ~/projects   claude-dev
+    ~/work       claude-work
+
+`~` stands for `$HOME`; blank lines and `#` comments are ignored, and so is
+anything after the container's name. Directories are split on whitespace,
+so they can't contain spaces. The longest directory containing the repo
+wins, so a nested entry can carve a subtree out for another container. A
+directory no entry owns runs git on the host -- an entry is therefore also
+a promise that the container mounts that directory at the same path.
+
+Without the file, the map is the single entry `~/projects claude-dev`,
+which is how `container-git` behaved before there was a map.
+`CLAUDE_CONTAINER`, if set, replaces whichever container the map chose,
+but never sends a directory the map doesn't list into a container.
+
+Keep the map outside every mounted directory, as `~/.config` is: an agent
+that could edit it could send the host's git for its own repos to the
+host, where their hooks would run as you. The emacs.d config reads the
+same file, so agent-shell starts in, and Magit's commit editor is
+signalled in, the container `container-git` would use.
+
+`tests/container-git-test.sh` checks the wrapper's choice, with a fake
+`docker` and a temporary `HOME`: run `sh tests/container-git-test.sh`.
 
 The emacs.d repo's `init.el` (its "Version control" section) points
 `magit-git-executable` and `vc-git-program` at the wrapper whenever a
@@ -237,7 +269,8 @@ the file to open and sleeps until signalled. Opening works because the
 paths match; finishing doesn't on its own, because with-editor signals the
 editor's PID with a `kill` on the host, and that PID is the container's.
 `init.el` advises `with-editor-return` to send the signal in the container
-instead.
+instead -- the one the map gives for the buffer's directory, the same one
+`container-git` ran git in.
 
 Not yet tried in practice: committing that way end to end, and speed --
 every git call pays for a `docker exec`, and Magit and vc make many.
